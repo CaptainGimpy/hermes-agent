@@ -3,6 +3,15 @@
 </p>
 
 # Hermes Agent ☤
+
+> **CaptainGimpy's personal fork.** This fork diverges from the upstream [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) with the following changes:
+> - **Skill onload hook** — skills declare `onload:` in SKILL.md frontmatter, running a script at session init. If the script prints `INJECT`, the skill body pre-loads into the system prompt volatile tier. Enables environment-triggered behavior mandates (model-specific, platform-specific) without keyword matching.
+> - **`${HERMES_HOME}` template variable** — resolves in SKILL.md alongside `${HERMES_SKILL_DIR}` and `${HERMES_SESSION_ID}`.
+> - **`/refine --report`** — review-only mode that lists proposed actions as structured JSON without executing any tool calls.
+> - **Desktop app (`apps/desktop/`) removed** — not needed for agent runtime.
+>
+> More changes to come as I see fit. I will not be updating from the upstream Hermes Agent codebase anymore.
+
 <p align="center">
   <a href="https://hermes-agent.nousresearch.com/">Hermes Agent</a> | <a href="https://hermes-agent.nousresearch.com/">Hermes Desktop</a>
 </p>
