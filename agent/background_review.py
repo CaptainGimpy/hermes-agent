@@ -22,14 +22,14 @@ import copy
 import json
 import logging
 import os
-from pathlib import Path
+import re
 import threading
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.thread_scoped_output import thread_scoped_silence
 
 logger = logging.getLogger(__name__)
-
 
 _BACKGROUND_REVIEW_CANCEL_TIMEOUT_SECONDS = 2.0
 
@@ -204,23 +204,6 @@ def cancel_background_review_for_live_turn(agent: Any) -> None:
 # Historical hardcoded iteration budget for the review fork.
 _REVIEW_MAX_ITERATIONS = 16
 
-# Default aggregate INPUT-token budget for one review fork (#93057). The
-# fork's first request replays the full snapshot — a warm prompt-cache read
-# that is cheap and intended (cache parity), which is why both compression
-# gates are deferred until the first provider response arrives
-# (_review_fork_first_request_pending in agent/turn_context.py). After that,
-# detached in-memory compaction bounds each request to roughly the
-# compression threshold, but nothing capped the SUM across the review's tool
-# loop: one production review made 8 requests replaying 1,487,951 input
-# tokens total (four of them at 350k-384k). This budget caps the aggregate;
-# the review tool loop stops before the provider call that would cross it
-# (see ``_review_input_budget_exhausted`` in agent/conversation_loop.py).
-# 2x the historical 300k foreground trigger keeps legitimate reviews
-# comfortable while capping the pathological case. Override with
-# ``auxiliary.background_review.max_input_tokens``; 0 or a negative value
-# disables the cap (unbounded = pre-fix behavior).
-_REVIEW_MAX_INPUT_TOKENS_DEFAULT = 600_000
-
 
 def _background_review_task_config(
     task_cfg: Optional[Dict[str, Any]] = None,
@@ -241,26 +224,6 @@ def _background_review_task_config(
     aux = cfg.get("auxiliary", {}) if isinstance(cfg.get("auxiliary"), dict) else {}
     task = aux.get("background_review", {})
     return task if isinstance(task, dict) else {}
-
-
-def _review_input_token_budget(
-    task_cfg: Optional[Dict[str, Any]] = None,
-) -> Optional[int]:
-    """Aggregate input-token budget for one review fork (None = unlimited).
-
-    Reads ``auxiliary.background_review.max_input_tokens``; falls back to
-    :data:`_REVIEW_MAX_INPUT_TOKENS_DEFAULT`. ``0`` or a negative value
-    disables the cap explicitly.
-    """
-    task = _background_review_task_config(task_cfg)
-    raw = task.get("max_input_tokens", _REVIEW_MAX_INPUT_TOKENS_DEFAULT)
-    try:
-        budget = int(raw)
-    except (TypeError, ValueError):
-        budget = _REVIEW_MAX_INPUT_TOKENS_DEFAULT
-    if budget <= 0:
-        return None
-    return budget
 
 
 def load_background_review_settings() -> tuple[bool, Dict[str, Any]]:
@@ -676,6 +639,26 @@ _COMBINED_REVIEW_PROMPT = (
     "and stop — but don't reach for that conclusion as a default."
 )
 
+# REPORT-ONLY suffix appended to the chosen review prompt by
+# ``spawn_background_review_thread`` when ``report_only=True`` (the
+# ``/refine --report`` path).  The fork lists what it would do as a
+# structured JSON block instead of executing any memory/skill writes.
+_REPORT_ONLY_PROMPT_SUFFIX = (
+    "\n\n"
+    "The user is running this review in REPORT only mode. Do NOT execute ANY "
+    "tool calls.\n"
+    "Instead, list what memory/skill actions you would take as a structured "
+    "JSON array.\n"
+    "Each item must have: action (add/update/remove), target "
+    "(memory/skill/user_profile),\n"
+    "content_preview (brief summary of what), name (if skill), reason (why).\n"
+    "Format your response as:\n"
+    "----PROPOSAL_START---\n"
+    '[{"action": "add", "target": "memory", ...}]\n'
+    "----PROPOSAL_END----\n"
+    "Then stop. Do not call any tools."
+)
+
 
 
 def summarize_background_review_actions(
@@ -1051,11 +1034,102 @@ def _log_review_completion(usage: Dict[str, Any], result: str) -> None:
     )
 
 
+# Rough JSON lark to crack open a proposal block even when the model wraps the
+# array in stray prose, fences, or trailing commas (the report-only fork is the
+# least-structured output the review path produces, so defect-tolerant parsing
+# here is worth a few lines).
+_JSON_LIST_START = re.compile(r"\[\s*\{")
+_JSON_LIST_END = re.compile(r"\}\s*\]")
+
+
+def _extract_report_proposals(
+    review_messages: List[Dict],
+) -> List[Dict]:
+    """Parse the ``----PROPOSAL_START--- … ----PROPOSAL_END----`` JSON out of
+    the report-only fork's generated text.
+
+    Walks the fork's assistant messages, joins their text, and pulls everything
+    inside the proposal markers.  Returns a list of proposal dicts, or ``[]``
+    when no parseable proposal block was found (including an explicit
+    "Nothing to save.").
+    """
+    if not review_messages:
+        return []
+    text_chunks: List[str] = []
+    for msg in review_messages:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        c = msg.get("content")
+        if isinstance(c, str):
+            text_chunks.append(c)
+        elif isinstance(c, list):
+            text_chunks.extend(
+                b.get("text", "") for b in c if isinstance(b, dict)
+            )
+    full_text = "\n".join(text_chunks)
+    if "----PROPOSAL_START---" not in full_text:
+        return []
+    block = full_text.split("----PROPOSAL_START---", 1)[1]
+    if "----PROPOSAL_END----" in block:
+        block = block.split("----PROPOSAL_END----", 1)[0]
+    start = _JSON_LIST_START.search(block)
+    end = _JSON_LIST_END.search(block)
+    if not start or not end or end.start() <= start.start():
+        logger.warning("Report-only review returned an unterminated proposal block.")
+        return []
+    payload = block[start.start(): end.end()]
+    try:
+        parsed = json.loads(payload)
+    except (json.JSONDecodeError, TypeError):
+        # Fall back to stripping trailing commas before the final close, which
+        # models commonly emit.
+        cleaned = _json_repair_trailing_commas(payload)
+        try:
+            parsed = json.loads(cleaned)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("Report-only proposal block was not parseable JSON.")
+            return []
+    if not isinstance(parsed, list):
+        return []
+    return [p for p in parsed if isinstance(p, dict)]
+
+
+def _json_repair_trailing_commas(payload: str) -> str:
+    """Remove trailing commas before each ``}``/``]`` so model-emitting JSON
+    with trailing commas still parses.  Best-effort; returns the input
+    unchanged when no repair is needed.
+    """
+    return re.sub(r",\s*([}\]])", r"\1", payload)
+
+
+def _print_report_proposals(
+    agent: Any,
+    proposals: List[Dict],
+) -> None:
+    """Render the report-only proposals as a numbered menu to the user."""
+    for i, p in enumerate(proposals, 1):
+        action = str(p.get("action", "update") or "update")
+        target = str(p.get("target", "memory") or "memory")
+        name = str(p.get("name", "") or "").strip()
+        preview = str(p.get("content_preview", "") or "").strip()
+        reason = str(p.get("reason", "") or "").strip()
+        label = action.upper()
+        part = f"  {i}. [{target}] {label}"
+        if name and target in ("skill", "skill_manage"):
+            part += f" '{name}'"
+        if preview:
+            part += f" — {preview}"
+        if reason:
+            part += f"\n     ↳ why: {reason[:160]}"
+        agent._safe_print(part)
+
+
 def _run_review_in_thread(
     agent: Any,
     messages_snapshot: List[Dict],
     prompt: str,
     task_cfg: Optional[Dict[str, Any]] = None,
+    report_only: bool = False,
     review_run: Optional[_BackgroundReviewRun] = None,
 ) -> None:
     """Worker function executed in the background-review daemon thread.
@@ -1068,6 +1142,12 @@ def _run_review_in_thread(
     :func:`prepare_background_review_run`.  If a live turn bumps the
     cancel generation before this review reaches its first provider call,
     the review aborts without entering ``run_conversation()`` (#84423).
+
+    When ``report_only=True`` (the ``/refine --report`` path) the fork is
+    instructed to output a structured JSON proposal block instead of
+    calling any tools.  The parsed proposals are printed as a numbered
+    list and stored on ``agent._last_review_proposals`` for the CLI to
+    offer interactive acceptance.
     """
     if review_run is not None and review_run.cancel_requested.is_set():
         finish_background_review_run(agent, review_run)
@@ -1310,101 +1390,27 @@ def _run_review_in_thread(
             # conversation (the review fires every ~10 turns). Leave session
             # finalization to the real owner (CLI close / gateway reset / cron).
             review_agent._end_session_on_close = False
-            # DETACHED IN-MEMORY COMPACTION (issue #93057). The fork shares
-            # the parent's session_id (pinned above for prefix-cache parity),
-            # so the historical guard here was ``compression_enabled = False``:
-            # if the fork ran the ordinary compression path it could rotate /
-            # archive the parent's live session — the sibling-session race
-            # behind #38727. But disabling compaction was a proxy for
-            # detachment, and it removed the ONLY bound on the review's
-            # private snapshot: as the review performs tool calls, every
-            # follow-up provider request replayed the snapshot plus the
-            # growing review tool loop (350k-384k input tokens per request in
-            # production, 1.49M total across one 8-request review).
-            #
-            # The fix is detachment, not disablement:
-            #   • Persistence is already off above (_persist_disabled /
-            #     _session_db=None), so the commit site in compress_context
-            #     (``if agent._session_db:``) skips every durable write and
-            #     compaction can only ever rewrite the fork's private
-            #     in-memory transcript.
-            #   • The compressor's OWN session binding still needs severing:
-            #     AIAgent.__init__ bound it to the parent's SessionDB and
-            #     session_id before this function nulled the agent-level
-            #     binding, so durable cooldown/streak/ineffective-count
-            #     writes would otherwise land on the parent's row. Rebinding
-            #     with session_db=None / session_id="" makes every
-            #     compressor persist guard a no-op.
-            #   • Force in-place mode (never rotation) even if the parent's
-            #     config selected rotation, and re-enable compression ONLY
-            #     after the rebind succeeds (fail-closed — see below). While
-            #     enabled, both compression gates stay deferred until the
-            #     fork's first provider response so request #1 replays the
-            #     full snapshot as a warm cache read.
-            _review_compressor = getattr(review_agent, "context_compressor", None)
-            _bind_review_compressor = getattr(
-                _review_compressor, "bind_session_state", None
-            )
-            _review_compression_detached = False
-            if callable(_bind_review_compressor):
-                try:
-                    # Plugin/third-party context engines may not accept these
-                    # kwargs; they own their own persistence policy, so a
-                    # failed rebind leaves the pre-existing flags in place
-                    # and must never abort the review (same tolerance as the
-                    # init-time binding in agent_init.py).
-                    _bind_review_compressor(session_db=None, session_id="")
-                    _review_compression_detached = True
-                except Exception:
-                    # FAIL-CLOSED (adversarial review, #93057): if the rebind
-                    # could not sever the engine's session binding, the
-                    # compressor may still point at the parent's
-                    # SessionDB/session_id. Enabling compression in that
-                    # state would let durable cooldown/streak/ineffective-
-                    # count writes land on the parent's row and re-open the
-                    # #38727 sibling race. Keep the historical
-                    # compression_enabled=False behavior instead and warn;
-                    # the review still runs, bounded by the iteration cap
-                    # and the aggregate input budget below.
-                    logger.warning(
-                        "background-review compressor detachment failed; "
-                        "keeping compression DISABLED on this review fork "
-                        "(fail-closed, issue #93057 / #38727)",
-                        exc_info=True,
-                    )
-            # Force in-place mode (never rotation) even if the parent's
-            # config selected rotation. Re-enable compression ONLY after the
-            # compressor's session binding was successfully severed; an
-            # engine without a bind hook keeps the historical disabled
-            # behavior as well.
-            review_agent.compression_in_place = True
-            review_agent.compression_enabled = _review_compression_detached
-            if _review_compression_detached:
-                # Warm-cache parity: the fork's FIRST provider request
-                # replays the parent's full snapshot as a warm prompt-cache
-                # read, so compaction must not rewrite the snapshot before
-                # that first request goes out. Defer both compression gates
-                # until the first provider response arrives (see
-                # _review_fork_first_request_pending in agent/turn_context.py
-                # and the pre-API gate in agent/conversation_loop.py); from
-                # the second request on, the fork's transcript is its own and
-                # compaction bounds it.
-                review_agent._review_defer_compaction_before_first_response = True
-            # Aggregate input budget: compaction bounds any single request;
-            # this bounds the WHOLE review. Iterations are already capped by
-            # _REVIEW_MAX_ITERATIONS. Checked in agent/conversation_loop.py
-            # via _review_input_budget_exhausted (issue #93057).
-            review_agent._review_input_token_budget = _review_input_token_budget(
-                task_cfg
-            )
+            # Never let the review fork compress. It shares the parent's
+            # session_id, so if it won a compression race it would rotate the
+            # parent into a NEW child that the gateway never adopts (the fork
+            # is single-lifecycle and dies right after this run_conversation).
+            # The foreground turn would then start from the stale parent and
+            # compress it again, leaving the same parent with two sibling
+            # children (issue #38727). Review also needs full context to
+            # produce a good memory/skill summary — compressing would strip
+            # detail. Both compression triggers in conversation_loop.py gate on
+            # agent.compression_enabled, so this short-circuits both paths.
+            review_agent.compression_enabled = False
 
             # Register this fork on the PARENT's _active_children (the same
             # list interrupt() fans out to for subagent delegation) and
             # _background_review_agent (a direct pointer the next live turn
-            # uses to interrupt an admitted request). The per-review run token
-            # separately fences startup and acknowledges request-phase exit.
-            # The legacy pointer/list remain best-effort for direct test stubs;
-            # a prepared run token is the live-turn cancellation authority.
+            # uses to proactively cancel a still-running review). Without
+            # this, a review still streaming when the next turn starts races
+            # the live turn against the same session_id/credentials — producing
+            # doubled prompt-token accounting and a Ctrl+C-proof lockup.
+            # Best-effort: agents built without agent_init.py (test stubs)
+            # degrade to "no cross-cancellation" rather than aborting the review.
             if hasattr(agent, "_background_review_agent"):
                 _br_lock = getattr(agent, "_background_review_lock", None)
                 if _br_lock is not None:
@@ -1508,6 +1514,30 @@ def _run_review_in_thread(
                 pass
             review_agent = None
 
+        # --- REPORT-ONLY path (``/refine --report``) ---
+        if report_only:
+            proposals = _extract_report_proposals(review_messages)
+            agent._last_review_proposals = proposals
+            if not proposals:
+                agent._safe_print(
+                    "  📋 REPORT: Review fork found nothing worth proposing."
+                )
+                _log_review_completion(review_usage, "none")
+            else:
+                _log_review_completion(
+                    review_usage,
+                    f"proposals({len(proposals)})",
+                )
+                agent._safe_print("  📋 REPORT — proposed changes (nothing was written):")
+                _print_report_proposals(agent, proposals)
+                agent._safe_print(
+                    "  ──\n"
+                    "  Send /refine without --report to execute immediately, or\n"
+                    "  review the proposals above and reply with actions to take."
+                )
+            return
+
+        # --- EXECUTION path (normal ``/refine``) ---
         # Scan the review agent's messages for successful tool actions
         # and surface a compact summary to the user. Tool messages
         # already present in messages_snapshot must be skipped, since
@@ -1599,6 +1629,7 @@ def spawn_background_review_thread(
     review_skills: bool = False,
     focus: Optional[str] = None,
     task_cfg: Optional[Dict[str, Any]] = None,
+    report_only: bool = False,
     review_run: Optional[_BackgroundReviewRun] = None,
 ):
     """Build the review thread target and prompt for a background review.
@@ -1617,6 +1648,17 @@ def spawn_background_review_thread(
     from :func:`load_background_review_settings`. When omitted, config is
     read once here and shared with the worker (aux routing) so a single
     turn does not re-parse the config file.
+
+    ``report_only`` (the ``/refine --report`` path) appends a suffix that
+    tells the fork to output a structured JSON proposal block instead of
+    calling any memory/skill tools.  The caller prints the parsed proposals
+    as a numbered list and stores them on ``agent._last_review_proposals``
+    for interactive review.
+
+    ``review_run`` is the per-review cancellation token from
+    :func:`prepare_background_review_run`.  When supplied, the review aborts
+    without entering ``run_conversation()`` if a live turn cancels it first
+    (#84423).
     """
     if task_cfg is None:
         task_cfg = _background_review_task_config()
@@ -1639,12 +1681,12 @@ def spawn_background_review_thread(
             f"{focus}"
         )
 
+    if report_only:
+        prompt += _REPORT_ONLY_PROMPT_SUFFIX
+
     def _target() -> None:
         _run_review_in_thread(
-            agent,
-            messages_snapshot,
-            prompt,
-            task_cfg=task_cfg,
+            agent, messages_snapshot, prompt, task_cfg, report_only=report_only,
             review_run=review_run,
         )
 
@@ -1655,9 +1697,12 @@ __all__ = [
     "_MEMORY_REVIEW_PROMPT",
     "_SKILL_REVIEW_PROMPT",
     "_COMBINED_REVIEW_PROMPT",
+    "_REPORT_ONLY_PROMPT_SUFFIX",
     "is_background_review_enabled",
     "load_background_review_settings",
     "spawn_background_review_thread",
     "summarize_background_review_actions",
     "build_memory_write_metadata",
+    "_extract_report_proposals",
+    "_print_report_proposals",
 ]
